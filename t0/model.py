@@ -1,10 +1,11 @@
 import logging
 from typing import Optional
+import numpy as np
 
 import torch
 from torch import nn
-from transformers import AutoModelForSeq2SeqLM, AutoModelForCausalLM, MODEL_FOR_CAUSAL_LM_MAPPING, \
-    MODEL_FOR_SEQ_TO_SEQ_CAUSAL_LM_MAPPING
+from torch.nn import CrossEntropyLoss
+from transformers import AutoModelForSeq2SeqLM, AutoModelForCausalLM, MODEL_FOR_CAUSAL_LM_MAPPING, MODEL_FOR_SEQ_TO_SEQ_CAUSAL_LM_MAPPING
 
 logger = logging.getLogger(__name__)
 
@@ -51,21 +52,46 @@ class EncoderDecoderModel(ModelBase):
         if parallelize:
             assert torch.cuda.is_available(), "You need at least 1 GPU to call `parallelize` (even though if there is only 1 GPU, there won't be any model parallelism)."
             self._model.parallelize()
-
+        
+        self.prompt_log_probs = None
+    
+    def set_prompt_prob(self, prompt):
+        logits = self._model(**prompt).logits
+        self.prompt_log_probs = torch.log_softmax(logits, dim=-1)
 
     def forward(self, batch) -> torch.Tensor:
         model_inputs = {
             k: batch[k]
             for k in ["input_ids", "attention_mask", "labels"]
         }
-        logits = self._model(**model_inputs).logits
-        masked_log_probs = batch["labels_attention_mask"].unsqueeze(-1) * torch.log_softmax(logits, dim=-1)
+        outputs = self._model(**model_inputs)
+        logits = outputs.logits
+        loss = outputs.loss
+        input_log_probs = torch.log_softmax(logits, dim=-1)
+        pmi_dc_loss = torch.tensor(0)
+        
+        if self.prompt_log_probs is not None:
+            batch_size = int(input_log_probs.size(0) / self.prompt_log_probs.size(0))
+            prompt_log_probs = torch.cat([self.prompt_log_probs for _ in range(batch_size)])
+            
+            if input_log_probs.size(1) == prompt_log_probs.size(1):
+                PMI_dc_probs = input_log_probs - prompt_log_probs
+                input_log_probs = PMI_dc_probs
+            
+                loss_fct = CrossEntropyLoss(ignore_index=-100)
+                pmi_dc_loss = loss_fct(input_log_probs.view(-1, input_log_probs.size(-1)), model_inputs['labels'].view(-1))
+            else:
+                print("pmi_dc_loss is NaN")
+                pmi_dc_loss = torch.tensor(np.NaN)
+        
+        masked_log_probs = batch["labels_attention_mask"].unsqueeze(-1) * input_log_probs
         seq_token_log_probs = torch.gather(masked_log_probs, -1, batch["labels"].unsqueeze(-1))
         seq_log_prob = seq_token_log_probs.squeeze(dim=-1).sum(dim=-1)
         seq_log_prob = seq_log_prob.view(batch["targets"].size(0),
                                          -1)  # TODO(Victor): this reshapes works based on the assumption that all examples have the same number of choices. the pre-processing doesn't make this assumption.
         predictions = seq_log_prob.argmax(dim=-1)
-        return predictions
+        predictions_probs = seq_log_prob.max(dim=-1).values
+        return predictions, predictions_probs, loss, pmi_dc_loss
 
 class DecoderModel(ModelBase):
     def __init__(self, config, model_name_or_path: Optional[str], **kwargs):
